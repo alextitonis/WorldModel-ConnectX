@@ -107,7 +107,7 @@ def add_trajectory_from_real_path(model, normalizer, memory, path_states, env=No
     """Adds every state of an actually-played, WON trajectory as a positive
     (attraction) example -- outcome = real distance to the end of this
     path."""
-    from train_utils import states_to_tensor
+    from .train_utils import states_to_tensor
 
     dedup = env is not None and env.discrete_state
     T = len(path_states) - 1
@@ -126,7 +126,7 @@ def add_negative_trajectory_from_real_path(model, normalizer, memory, path_state
     needed: `EpisodicMemory.query_batch`'s existing k-NN blend already
     treats a nearby HIGH-outcome entry as repulsion by construction, the
     exact mirror of how a low one acts as attraction."""
-    from train_utils import states_to_tensor
+    from .train_utils import states_to_tensor
 
     dedup = env is not None and env.discrete_state
     for s in path_states:
