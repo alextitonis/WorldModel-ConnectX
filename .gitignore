@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Trained checkpoints -- regenerable via scripts/train.py, deliberately NOT
+# blanket-ignored: checkpoints/connectx_checkpoint.pt (the one actually
+# shipped/deployed) is explicitly kept, everything else here is not.
+checkpoints/*.pt
+!checkpoints/connectx_checkpoint.pt
+
+# Local run logs / scratch output
+*.log
+*.out
+
+# OS/editor cruft
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
