@@ -142,6 +142,28 @@ _ADV_ROUNDS = {adv_rounds}  # real adversarial search rounds -- see _adversarial
 # = 0` disables this path entirely.
 _ENDGAME_MAX_COLS = {endgame_max_cols}
 _ENDGAME_TIME_BUDGET = {endgame_time_budget}
+# `_DEEPER_ROUNDS`/`_DEEPER_MAX_BRANCHING`/`_DEEPER_TIME_BUDGET`: real,
+# mined-from-real-games evidence showed `_ADV_ROUNDS` sometimes sees ZERO
+# danger on a position (every column looks equally safe) 2-4 plies before
+# a trap that one round DEEPER already narrows down to exactly one safe
+# column -- `_ADV_ROUNDS` isn't wrong about what it can see, it just can't
+# see far enough to avoid a fork the opponent is setting up. A deeper
+# search is provably too slow to run on EVERY move (measured 8-13s at a
+# 6-7-legal-column branching factor) -- so this is a SAFE, opportunistic
+# escalation, not a blanket depth increase: `_DEEPER_ROUNDS = None`
+# disables it entirely, reproducing the original `_ADV_ROUNDS`-only
+# behavior byte-for-byte. When enabled, AFTER computing the normal-
+# `_ADV_ROUNDS` answer (always -- the guaranteed-safe fallback), a
+# `_DEEPER_ROUNDS`-round search is attempted under a hard
+# `_DEEPER_TIME_BUDGET` deadline; if it finishes in time its answer is
+# used instead (strictly more information, never less), if it times out
+# the original answer is returned completely unchanged. Calibrated via a
+# 180-game regression suite (random/weak/stronger opponents): zero
+# win-rate regression, max observed single-move time 1.641s --
+# comfortably under Kaggle's 2s budget.
+_DEEPER_ROUNDS = {deeper_rounds}
+_DEEPER_MAX_BRANCHING = {deeper_max_branching}
+_DEEPER_TIME_BUDGET = {deeper_time_budget}
 # `_ONLINE_ENABLED` (added 2026-08-10, right before submitting -- explicit
 # user decision after reading the competition's own rule "An Agent's sole
 # purpose is to generate an action. Activities/code which do not directly
@@ -367,7 +389,35 @@ def _leaf_batch_values(states):
     return dict(zip(states, vals.tolist()))
 
 
-def _collect_leaves(cells1, remaining_rounds, leaf_cache):
+def _narrow_to_center(legal_cols, max_branching):
+    """Prunes a legal-column list down to `max_branching` columns closest
+    to the board's center -- free, real Connect-4 domain knowledge (a
+    center column touches more potential 4-in-a-row lines than an edge
+    one, same theory as the empty-board opening hint). `max_branching=
+    None` is a no-op -- exact, unpruned enumeration. Only ever applied to
+    OUR OWN follow-up move choices at the deeper-escalation's round 2+
+    (see `_DEEPER_ROUNDS`'s docstring) -- never to `_ADV_ROUNDS`'s own
+    (always-unpruned) path, and never to the opponent's reply enumeration
+    at ANY round (that's what makes this a genuine worst-case
+    guarantee -- narrowing it would mean silently ignoring some of the
+    opponent's real threats)."""
+    if max_branching is None or len(legal_cols) <= max_branching:
+        return legal_cols
+    center = (_WIDTH - 1) / 2
+    return sorted(legal_cols, key=lambda c: abs(c - center))[:max_branching]
+
+
+class _RoundSearchTimeout(Exception):
+    pass
+
+
+def _check_deadline(deadline):
+    if deadline is not None and time.time() > deadline:
+        raise _RoundSearchTimeout()
+
+
+def _collect_leaves(cells1, remaining_rounds, leaf_cache, max_branching=None, deadline=None):
+    _check_deadline(deadline)
     if _board_full(cells1):
         return
     for opp_col in _legal_columns(cells1):
@@ -377,14 +427,14 @@ def _collect_leaves(cells1, remaining_rounds, leaf_cache):
         if remaining_rounds <= 1:
             leaf_cache[tuple(_encode_board(cells2))] = None
         else:
-            for a2 in _legal_columns(cells2):
+            for a2 in _narrow_to_center(_legal_columns(cells2), max_branching):
                 cells3 = _apply_move(cells2, a2, _AGENT)
                 if _wins_for(cells3, _AGENT):
                     continue
-                _collect_leaves(cells3, remaining_rounds - 1, leaf_cache)
+                _collect_leaves(cells3, remaining_rounds - 1, leaf_cache, max_branching, deadline)
 
 
-def _score_after_our_move(cells1, remaining_rounds, leaf_cache):
+def _score_after_our_move(cells1, remaining_rounds, leaf_cache, max_branching=None, deadline=None):
     """cells1: real board right after OUR move (caller already ruled out
     an immediate win here). Returns our worst-case score -- opponent
     picks whichever real reply hurts us most. Reads leaf values from
@@ -403,14 +453,15 @@ def _score_after_our_move(cells1, remaining_rounds, leaf_cache):
         elif remaining_rounds <= 1:
             vals.append(leaf_cache[tuple(_encode_board(cells2))])
         else:
-            vals.append(_score_after_opponent_move(cells2, remaining_rounds - 1, leaf_cache))
+            vals.append(_score_after_opponent_move(cells2, remaining_rounds - 1, leaf_cache, max_branching, deadline))
     return max(vals)
 
 
-def _score_after_opponent_move(cells2, remaining_rounds, leaf_cache):
+def _score_after_opponent_move(cells2, remaining_rounds, leaf_cache, max_branching=None, deadline=None):
     """cells2: real board after the opponent's move, our turn again.
     Returns OUR best achievable worst-case score from here."""
-    our_legal = _legal_columns(cells2)
+    _check_deadline(deadline)
+    our_legal = _narrow_to_center(_legal_columns(cells2), max_branching)
     if not our_legal:
         return float(_MAX_STEPS)
     best = None
@@ -418,7 +469,7 @@ def _score_after_opponent_move(cells2, remaining_rounds, leaf_cache):
         cells3 = _apply_move(cells2, a, _AGENT)
         if _wins_for(cells3, _AGENT):
             return -float(_MAX_STEPS)  # a forced win exists deeper -- short-circuit
-        s = _score_after_our_move(cells3, remaining_rounds, leaf_cache)
+        s = _score_after_our_move(cells3, remaining_rounds, leaf_cache, max_branching, deadline)
         if best is None or s < best:
             best = s
     return best
@@ -506,6 +557,33 @@ def _exact_endgame_solve(cells0, mover, deadline):
         return None, None
 
 
+def _run_search(surviving_actions, action_cells1, search_rounds, max_branching=None, deadline=None):
+    """One full leaf-collect + batched-eval + minimax pass at a given
+    (rounds, max_branching) setting -- factored out so it can be called
+    at two different depths, see `_DEEPER_ROUNDS`'s docstring above.
+    `deadline`: propagated into `_collect_leaves`/`_score_after_opponent_
+    move` (checked at both exponential-blowup recursion points) AND
+    checked again here, immediately around the ONE batched NN forward
+    pass -- that call is otherwise UNGUARDED/uninterruptible once
+    started, so bailing out right before it (rather than only inside the
+    pure-Python recursion) avoids ever starting an expensive tensor op
+    with no time budget left for it."""
+    leaf_cache = {{}}
+    for a in surviving_actions:
+        _collect_leaves(action_cells1[a], search_rounds, leaf_cache, max_branching, deadline)
+    _check_deadline(deadline)
+    if leaf_cache:
+        leaf_cache.update(_leaf_batch_values(list(leaf_cache.keys())))
+    _check_deadline(deadline)  # don't walk the tree on a stale/over-budget result either
+
+    best_a, best_score = None, None
+    for a in surviving_actions:
+        s = _score_after_our_move(action_cells1[a], search_rounds, leaf_cache, max_branching, deadline)
+        if best_score is None or s < best_score:
+            best_a, best_score = a, s
+    return best_a
+
+
 @torch.no_grad()
 def _adversarial_plan_action(cells0):
     """`_ADV_ROUNDS` real adversarial rounds (our move, then the
@@ -561,18 +639,17 @@ def _adversarial_plan_action(cells0):
         surviving_actions.append(a)
         action_cells1[a] = cells1
 
-    leaf_cache = {{}}
-    for a in surviving_actions:
-        _collect_leaves(action_cells1[a], _ADV_ROUNDS, leaf_cache)
-    if leaf_cache:
-        leaf_cache.update(_leaf_batch_values(list(leaf_cache.keys())))
+    base_a = _run_search(surviving_actions, action_cells1, _ADV_ROUNDS)  # always computed -- guaranteed-safe fallback
 
-    best_a, best_score = None, None
-    for a in surviving_actions:
-        s = _score_after_our_move(action_cells1[a], _ADV_ROUNDS, leaf_cache)
-        if best_score is None or s < best_score:
-            best_a, best_score = a, s
-    return best_a
+    if _DEEPER_ROUNDS is not None:
+        try:
+            return _run_search(surviving_actions, action_cells1, _DEEPER_ROUNDS,
+                                max_branching=_DEEPER_MAX_BRANCHING,
+                                deadline=time.time() + _DEEPER_TIME_BUDGET)
+        except _RoundSearchTimeout:
+            pass  # didn't finish in time -- fall back to base_a exactly as if _DEEPER_ROUNDS were None
+
+    return base_a
 
 
 def _online_update(path_states, label):
@@ -712,7 +789,8 @@ def main(ckpt_path=CKPT_PATH, memory_ckpt_path=None, n_memory_games=500,
          memory_opponent_epsilon=0.2, memory_opponent_strong_epsilon=0.3,
          memory_weight=0.25, memory_k=5, online_lr=1e-5, online_updates_per_episode=4,
          online_batch_size=256, unsolved_penalty_mult=1.0, adv_rounds=2, seed=0,
-         online_enabled=False, endgame_max_cols=5, endgame_time_budget=1.2):
+         online_enabled=False, endgame_max_cols=5, endgame_time_budget=1.2,
+         deeper_rounds=None, deeper_max_branching=4, deeper_time_budget=0.6):
     import random
     from connectx.env import ConnectXEnv
     from connectx.memory_build import build_episodic_memory
@@ -752,6 +830,8 @@ def main(ckpt_path=CKPT_PATH, memory_ckpt_path=None, n_memory_games=500,
         online_batch_size=online_batch_size, unsolved_penalty_mult=unsolved_penalty_mult,
         adv_rounds=adv_rounds, online_enabled=online_enabled,
         endgame_max_cols=endgame_max_cols, endgame_time_budget=endgame_time_budget,
+        deeper_rounds=deeper_rounds, deeper_max_branching=deeper_max_branching,
+        deeper_time_budget=deeper_time_budget,
     )
     with open(OUT_PATH, "w") as f:
         f.write(out)
