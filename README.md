@@ -1,5 +1,7 @@
 # ConnectX-WorldModel
 
+**By Alexandros Titonis**
+
 A reinforcement-learning world model (encoder + latent dynamics + value head)
 combined with real adversarial search and an exact endgame solver, applied to
 Kaggle's **[ConnectX competition](https://kaggle.com/competitions/connectx)**

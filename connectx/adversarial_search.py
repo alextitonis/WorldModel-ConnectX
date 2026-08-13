@@ -350,11 +350,34 @@ def real_adversarial_plan_action(env, model, normalizer, real_state, memory=None
             leaf_cache.update(leaf_batch_values(list(leaf_cache.keys())))
         check_deadline()  # and once more right after -- don't walk the tree on a stale/over-budget result
 
-        best_a, best_score = None, None
+        def hands_immediate_win(cells1):
+            """True if the OPPONENT has an immediate (1-ply) winning
+            reply from `cells1` (the real board right after OUR
+            candidate move). Tie-break added 2026-08-13, ported from the
+            private tree's identical fix -- found by mining fresh real
+            Kaggle replays for a deployed submission whose public score
+            dropped after adding a deeper-search escalation: most losses
+            traced to genuine forced-loss positions a deeper search
+            simply discovered sooner (every candidate correctly scored
+            equally bad), but with everything tied on score, the plain
+            `<` comparison below kept whichever move came first in
+            center-out order -- not necessarily one that avoided handing
+            the opponent an immediate win THIS move, even when a tied
+            alternative existed that did. Against a real, imperfect
+            opponent pool, an immediate giveaway forfeits every chance of
+            a mistake; delaying the loss does not."""
+            for opp_col in _legal_columns(cells1, width, height):
+                if _wins_for(_apply_move(cells1, opp_col, OPPONENT, width, height), OPPONENT, width, height, win_len):
+                    return True
+            return False
+
+        best_a, best_score, best_hands_win = None, None, None
         for a in surviving_actions:
             s = score_after_our_move(action_cells1[a], search_rounds, leaf_cache)
-            if best_score is None or s < best_score:
-                best_a, best_score = a, s
+            hands_win = hands_immediate_win(action_cells1[a])
+            key = (s, hands_win)
+            if best_score is None or key < (best_score, best_hands_win):
+                best_a, best_score, best_hands_win = a, s, hands_win
         return best_a
 
     root_legal = _legal_columns(cells_now, width, height)

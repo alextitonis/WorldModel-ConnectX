@@ -557,6 +557,31 @@ def _exact_endgame_solve(cells0, mover, deadline):
         return None, None
 
 
+def _hands_immediate_win(cells1):
+    """True if the OPPONENT has an immediate (1-ply) winning reply
+    available from `cells1` -- the real board right after OUR candidate
+    move. Added 2026-08-13, ported from the private tree's identical
+    fix -- see `_run_search`'s own comment for the real regression this
+    fixes: found by mining fresh Kaggle replays for a deployed
+    submission whose public score dropped after adding a deeper-search
+    escalation. Most affected losses were already genuine forced losses
+    regardless of our move (a deeper search simply SEES that sooner,
+    correctly scoring every candidate identically badly), but with
+    every candidate tied on score, `_run_search`'s plain `<` comparison
+    silently kept whichever move came first in center-out order --
+    which is NOT necessarily one that avoids handing the opponent an
+    immediate win THIS move, even when a tied alternative exists that
+    does. Against a real, imperfect opponent pool (not a perfect
+    solver), an immediate giveaway forfeits every chance of a mistake;
+    delaying the loss does not, so this is a real improvement even in
+    an already-lost position, not just cosmetic. Cheap: one extra
+    O(width) legal-move scan per candidate."""
+    for opp_col in _legal_columns(cells1):
+        if _wins_for(_apply_move(cells1, opp_col, _OPPONENT), _OPPONENT):
+            return True
+    return False
+
+
 def _run_search(surviving_actions, action_cells1, search_rounds, max_branching=None, deadline=None):
     """One full leaf-collect + batched-eval + minimax pass at a given
     (rounds, max_branching) setting -- factored out so it can be called
@@ -567,7 +592,13 @@ def _run_search(surviving_actions, action_cells1, search_rounds, max_branching=N
     pass -- that call is otherwise UNGUARDED/uninterruptible once
     started, so bailing out right before it (rather than only inside the
     pure-Python recursion) avoids ever starting an expensive tensor op
-    with no time budget left for it."""
+    with no time budget left for it.
+
+    Tie-break (added 2026-08-13, see `_hands_immediate_win`'s docstring):
+    among candidates tied on `s`, prefer one that does NOT hand the
+    opponent an immediate 1-ply win. Strictly refines the prior
+    center-out-only tie-break -- never overrides a genuinely BETTER
+    score, only breaks ties among equally-scored candidates."""
     leaf_cache = {{}}
     for a in surviving_actions:
         _collect_leaves(action_cells1[a], search_rounds, leaf_cache, max_branching, deadline)
@@ -576,11 +607,13 @@ def _run_search(surviving_actions, action_cells1, search_rounds, max_branching=N
         leaf_cache.update(_leaf_batch_values(list(leaf_cache.keys())))
     _check_deadline(deadline)  # don't walk the tree on a stale/over-budget result either
 
-    best_a, best_score = None, None
+    best_a, best_score, best_hands_win = None, None, None
     for a in surviving_actions:
         s = _score_after_our_move(action_cells1[a], search_rounds, leaf_cache, max_branching, deadline)
-        if best_score is None or s < best_score:
-            best_a, best_score = a, s
+        hands_win = _hands_immediate_win(action_cells1[a])
+        key = (s, hands_win)
+        if best_score is None or key < (best_score, best_hands_win):
+            best_a, best_score, best_hands_win = a, s, hands_win
     return best_a
 
 
