@@ -75,9 +75,19 @@ def _evaluate_with_memory(model, cand_z, memory, memory_weight, memory_k):
 @torch.no_grad()
 def plan_action(env, model, normalizer, real_state, depth=3, beam_width=8, caution=1.0, rng=None,
                  memory=None, memory_weight=0.25, memory_k=5):
-    """Best first action for real_state, chosen by beam search purely in
-    latent space. depth=1 reduces exactly to Baseline A (no lookahead
-    beyond the immediate predicted next state)."""
+    """Best first action for real_state, chosen by beam search over chained
+    imagined latents, with environment-defined legality gating the branching
+    at every ply -- NOT a purely-latent search (see the module docstring's
+    decode-gate paragraph): the rollout (`imagine_step`) and the value
+    judgement stay fully latent, but the root ply's allowed set comes from
+    `env.is_legal(real_state, ...)` and deeper plies DECODE each beam entry's
+    latent to an estimated real state and call `env.is_legal` on that
+    whenever the `caution` draw succeeds (caution=1.0, the default, means
+    always). Accurately: latent dynamics and latent value evaluation, with
+    decoded-state, environment-defined legality gating at deeper plies.
+    depth=1 reduces exactly to Baseline A (no lookahead beyond the immediate
+    predicted next state -- and, having no step>0 plies, the one config that
+    genuinely never decodes)."""
     rng = rng or random
 
     root_legal = [a for a in range(env.num_actions) if env.is_legal(real_state, a)]
