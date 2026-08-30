@@ -90,6 +90,85 @@ freshly-uploaded rating as a verdict. 7x6 Connect-4 is a mathematically
 solvers; these results demonstrate the architecture works on this domain,
 not a leaderboard-rating prediction.
 
+## The exact solver, and what it changed (2026-08-30)
+
+The agent has always carried an exact endgame solver, but it was plain Python
+with a tuple-keyed memo, and it was gated at **≤ 5 legal columns** because that
+was its practical reach. Two things were blocked behind that gate: a strong
+enough opponent to tell agent configurations apart, and any analysis of a real
+loss that was decided before the endgame.
+
+`connectx/bitboard_solver.py` removes it — bitboards over a 7-bits-per-column
+layout, `position + mask` as a unique key, a transposition table storing
+**bounds** rather than plain values, losing-move pruning, and move ordering by
+threats created. It agrees with the older solver on **40/40** randomly reached
+endgame positions and runs **~50–70× faster** on the same ones, resolving
+midgame positions with 6+ open columns that the older one could not.
+
+**How it was validated, and why that matters.** The first version of the new
+solver agreed with the old one on **37 of 40** positions — the kind of number
+that reads like edge-case noise in fresh code. It was not: an independent third
+implementation (`connectx/solver_referee.py` — plain minimax, *no alpha-beta*,
+cell-scan win detection, no shared machinery) judged all three disagreements and
+the new solver was wrong in **3 of 3**. The cause was a single line in the
+position update. A high agreement rate is not a pass; the residual is where the
+bug lives.
+
+### A measured consequence: resisting in a lost endgame
+
+The older solver returns only +1 / 0 / −1 — it carries no information about
+*how fast* a result arrives. So when every move loses they all score alike and
+it picks arbitrarily, frequently choosing the fastest loss. Against perfect play
+that costs nothing. Against the imperfect agents a real ladder is full of, it
+discards every chance the opponent errs first.
+
+`_resisting_endgame_solve` prefers the slowest loss (and the fastest win).
+Measured from **proven-lost** positions — verified lost by the solver, so this
+is a fact and not an estimate — playing each out twice from the identical
+position against the identical opponent with paired seeds:
+
+| opponent | legacy escapes | resisting escapes | Δ | game length |
+|---|---|---|---|---|
+| perfect play *(control)* | 0.000 | **0.000** | +0.000 | +4.3 plies |
+| weak heuristic | 0.100 | **0.300** | **+0.200** | +3.5 plies |
+| stronger heuristic | 0.150 | **0.225** | +0.075 | +3.8 plies |
+
+The control is what makes the rest trustworthy: against perfect play both arms
+escape exactly 0.000, because the positions really are lost — while resisting
+still survives 4.3 plies longer. The mechanism works without manufacturing
+false escapes. At n = 40 the +0.200 is solid and the +0.075 is directional.
+
+### Deployed (2026-08-31)
+
+Both are now **on by default** in the shipped `submission.py`. The gate is set
+by calibration, not optimism — legal-column count controls branching, so it is
+what the gate keys on:
+
+| legal columns | solved within 1.0s | median | p90 | max |
+|---|---|---|---|---|
+| 4 | 30/30 | 0.000s | 0.001s | 0.001s |
+| 5 | 30/30 | 0.000s | 0.003s | **0.017s** |
+| 6 | 30/30 | 0.000s | 0.037s | **0.843s** |
+| 7 | **23/30** | 0.068s | 1.008s | capped |
+
+So `_ENDGAME_MAX_COLS` moved 5 → **6** and `_ENDGAME_TIME_BUDGET` moved
+1.2s → **0.6s**. The budget went *down* while reach went *up*: at 5 columns the
+older solver's worst case was 0.373s and this one's is 0.017s. Seven columns
+resolves only 23/30 within a second, which is why the gate stops at six.
+
+**The older solver is kept as a fallback, not replaced** — if the bitboard
+solver misses its budget the call falls through to it, then to the round
+search, so the failure path is exactly the previous behaviour.
+
+Measured on the rebuilt agent before shipping: **103 timed moves, median
+0.416s, p90 0.713s, max 0.967s** against Kaggle's 2.0s cap, with the whole-call
+1.5s cap still behind it. Against a discriminating opponent over 6 seeds the
+change scored **mean +0.036, interval [−0.001, +0.074]** versus the previous
+build — which **straddles zero, so this is recorded as no regression rather
+than as a confirmed improvement.** That is the expected shape: the endgame
+solver only fires once a position narrows to ≤6 columns, and resisting only
+pays in positions already lost.
+
 ## Running locally
 
 Requires Python 3.10+ and PyTorch (CPU is fine — nothing here needs a GPU;
@@ -113,6 +192,16 @@ python -m scripts.lora_selfplay_finetune
 
 # Package a checkpoint + offline self-play memory into a self-contained Kaggle submission.py
 python -c "from scripts.build_submission import main; main()"
+
+# Exact-solver self-test: cross-validates the bitboard solver against the older
+# one on real positions, and checks it reaches past the older one's limits
+python -m tests.bitboard_solver_test
+
+# Adjudicate a disagreement between the two solvers with an independent referee
+python -m connectx.solver_referee
+
+# Does resisting longer in a proven-lost endgame actually convert losses?
+python -m connectx.resisting_endgame_eval
 ```
 
 Run everything from the repository root (not from inside `connectx/` or
@@ -180,12 +269,16 @@ connectx-opensource/
     episodic_memory.py               k-NN memory over real self-play trajectories (won + lost)
     memory_build.py                  Builds that memory offline, at packaging time
     lora.py                          Generic LoRA wrapper
+    bitboard_solver.py               Exact strong solver: bitboards + transposition table (Section 4.2)
+    solver_referee.py                Independent no-alpha-beta minimax, used to adjudicate solver disagreements
+    resisting_endgame_eval.py        Measures whether resisting longer in a lost endgame converts losses
   scripts/                         Executable entry points (run as `python -m scripts.<name>`)
     train.py                         Full training pipeline (stage 1 + stage 2 + self-play)
     lora_selfplay_finetune.py        LoRA self-play fine-tune of an existing checkpoint
     build_submission.py              Packages a checkpoint + memory into one self-contained submission.py
   tests/
     submission_test.py               The trusted, independent test harness
+    bitboard_solver_test.py          Solver self-test, incl. cross-validation against the older solver
   checkpoints/
     connectx_checkpoint.pt           Trained weights
   docs/

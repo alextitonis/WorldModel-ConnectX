@@ -475,6 +475,237 @@ def _score_after_opponent_move(cells2, remaining_rounds, leaf_cache, max_branchi
     return best
 
 
+# ---------------------------------------------------------------------
+# Bitboard endgame solver (added 2026-08-31). Standalone port of
+# connectx/connectx_bitboard_solver.py -- no imports, same convention as
+# every other function in this generated file.
+#
+# It replaces `_exact_endgame_solve` as the FIRST endgame attempt for two
+# separate reasons, both measured:
+#
+# 1. REACH. It is 50-70x faster on identical positions, which is what let
+#    `_ENDGAME_MAX_COLS` rise from 5 to 6. Calibrated here: at 5 legal
+#    columns the old solver's worst case was 0.373s and this one's is
+#    0.017s; at 6 columns (which the old one could not do at all inside a
+#    5s cap) median 0.000s, p90 0.037s, worst observed 0.843s. 7 columns
+#    resolves only 23/30 within 1s, so the gate stops at 6.
+#
+# 2. IT RESISTS. `_exact_endgame_solve` returns only +1/0/-1 and carries
+#    no distance information, so when EVERY move loses they all score
+#    alike and it picks arbitrarily -- frequently the fastest loss.
+#    This solver's score encodes distance, so its argmax prefers the
+#    slowest loss and the fastest win. Measured from proven-lost
+#    positions with paired seeds: escape rate 0.100 -> 0.300 against a
+#    weak opponent, 0.150 -> 0.225 against a stronger one, with games
+#    roughly twice as long. Control: against PERFECT play both score
+#    exactly 0.000, so it does not manufacture false escapes.
+#
+# The old solver is kept as the fallback: if this one misses its budget
+# it returns None and the caller tries that, then the round search.
+_BB_H1 = _HEIGHT + 1
+_BB_H2 = _HEIGHT + 2
+_BB_BOARD_MASK = 0
+_BB_BOTTOM_MASK = 0
+for _bb_c in range(_WIDTH):
+    _BB_BOARD_MASK |= ((1 << _HEIGHT) - 1) << (_bb_c * _BB_H1)
+    _BB_BOTTOM_MASK |= 1 << (_bb_c * _BB_H1)
+_BB_COL_ORDER = sorted(range(_WIDTH), key=lambda c: (abs(c - (_WIDTH - 1) / 2.0), c))
+
+
+def _bb_column_mask(col):
+    return ((1 << _HEIGHT) - 1) << (col * _BB_H1)
+
+
+def _bb_winning_positions(position, mask):
+    """Every empty square that would complete a four for `position`."""
+    r = (position << 1) & (position << 2) & (position << 3)
+    for shift in (_BB_H1, _HEIGHT, _BB_H2):
+        p = (position << shift) & (position << (2 * shift))
+        r |= p & (position << (3 * shift))
+        r |= p & (position >> shift)
+        p = (position >> shift) & (position >> (2 * shift))
+        r |= p & (position << shift)
+        r |= p & (position >> (3 * shift))
+    return r & (_BB_BOARD_MASK ^ mask)
+
+
+def _bb_possible(mask):
+    return (mask + _BB_BOTTOM_MASK) & _BB_BOARD_MASK
+
+
+def _bb_can_win_next(position, mask):
+    return bool(_bb_winning_positions(position, mask) & _bb_possible(mask))
+
+
+def _bb_non_losing(position, mask):
+    """Playable moves that do not hand the opponent an immediate win.
+    Returns 0 when every move loses, including the two-forced-threats
+    case, which is resolved here with no recursion."""
+    possible_mask = _bb_possible(mask)
+    opponent_win = _bb_winning_positions(position ^ mask, mask)
+    forced = possible_mask & opponent_win
+    if forced:
+        if forced & (forced - 1):
+            return 0
+        possible_mask = forced
+    return possible_mask & ~(opponent_win >> 1)
+
+
+def _bb_from_cells(cells, mark):
+    """(position, mask, n_moves) for `mark` to move, or None on a board
+    that violates gravity (which cannot occur in a real game)."""
+    position = 0
+    mask = 0
+    for col in range(_WIDTH):
+        seen_empty = False
+        for row in range(_HEIGHT - 1, -1, -1):
+            v = cells[row * _WIDTH + col]
+            if v == 0:
+                seen_empty = True
+                continue
+            if seen_empty:
+                return None
+            bit = 1 << (col * _BB_H1 + (_HEIGHT - 1 - row))
+            mask |= bit
+            if v == mark:
+                position |= bit
+    return position, mask, bin(mask).count("1")
+
+
+class _BBBudget(Exception):
+    pass
+
+
+class _BBSolver(object):
+    def __init__(self, max_nodes, deadline):
+        self.max_nodes = max_nodes
+        self.deadline = deadline
+        self.tt = dict()
+        self.nodes = 0
+
+    def _tick(self):
+        self.nodes += 1
+        if self.nodes > self.max_nodes:
+            raise _BBBudget()
+        if (self.nodes & 0x1FF) == 0 and time.time() > self.deadline:
+            raise _BBBudget()
+
+    def negamax(self, position, mask, alpha, beta, moves):
+        """Exact score for the side to move; assumes it has no immediate win."""
+        self._tick()
+        non_losing = _bb_non_losing(position, mask)
+        if non_losing == 0:
+            return -((_WIDTH * _HEIGHT - moves) // 2)
+        if moves >= _WIDTH * _HEIGHT - 2:
+            return 0
+        min_score = -((_WIDTH * _HEIGHT - 2 - moves) // 2)
+        if alpha < min_score:
+            alpha = min_score
+            if alpha >= beta:
+                return alpha
+        max_score = (_WIDTH * _HEIGHT - 1 - moves) // 2
+        if beta > max_score:
+            beta = max_score
+            if alpha >= beta:
+                return beta
+
+        key = position + mask
+        entry = self.tt.get(key)
+        if entry is not None:
+            lower, upper = entry
+            if lower >= beta:
+                return lower
+            if upper <= alpha:
+                return upper
+            if lower > alpha:
+                alpha = lower
+            if upper < beta:
+                beta = upper
+            if alpha >= beta:
+                return alpha
+        alpha_orig, beta_orig = alpha, beta
+
+        cands = []
+        for col in _BB_COL_ORDER:
+            in_col = non_losing & _bb_column_mask(col)
+            if not in_col:
+                continue
+            move_bit = in_col & -in_col
+            nxt_mask = mask | move_bit
+            nxt_pos = position ^ mask
+            ours = nxt_pos ^ nxt_mask
+            threats = bin(_bb_winning_positions(ours, nxt_mask)).count("1")
+            cands.append((-threats, nxt_pos, nxt_mask))
+        cands.sort(key=lambda z: z[0])
+
+        best = -1000
+        for _t, nxt_pos, nxt_mask in cands:
+            val = -self.negamax(nxt_pos, nxt_mask, -beta, -alpha, moves + 1)
+            if val > best:
+                best = val
+            if best > alpha:
+                alpha = best
+            if alpha >= beta:
+                break
+
+        if len(self.tt) < 1500000:
+            if best <= alpha_orig:
+                self.tt[key] = (-1000, best)
+            elif best >= beta_orig:
+                self.tt[key] = (best, 1000)
+            else:
+                self.tt[key] = (best, best)
+        return best
+
+    def best_move(self, position, mask):
+        """(col, score) for the side to move, or (None, None) on budget.
+        Every root move is scored, so the choice genuinely maximises the
+        distance-aware score rather than stopping at a first cutoff --
+        that is what makes it resist in a lost position."""
+        moves = bin(mask).count("1")
+        possible_mask = _bb_possible(mask)
+        win_mask = _bb_winning_positions(position, mask) & possible_mask
+        if win_mask:
+            for col in _BB_COL_ORDER:
+                if win_mask & _bb_column_mask(col):
+                    return col, (_WIDTH * _HEIGHT + 1 - moves) // 2
+        try:
+            best_col, best_score = None, None
+            for col in _BB_COL_ORDER:
+                in_col = possible_mask & _bb_column_mask(col)
+                if not in_col:
+                    continue
+                move_bit = in_col & -in_col
+                nxt_mask = mask | move_bit
+                nxt_pos = position ^ mask
+                if _bb_can_win_next(nxt_pos, nxt_mask):
+                    val = -((_WIDTH * _HEIGHT + 1 - (moves + 1)) // 2)
+                else:
+                    val = -self.negamax(nxt_pos, nxt_mask,
+                                        -(_WIDTH * _HEIGHT) // 2,
+                                        (_WIDTH * _HEIGHT) // 2, moves + 1)
+                if best_score is None or val > best_score:
+                    best_col, best_score = col, val
+            return best_col, best_score
+        except _BBBudget:
+            return None, None
+
+
+def _bitboard_endgame_solve(cells0, mover, deadline, max_nodes=1200000):
+    """`_exact_endgame_solve`'s drop-in: (best_action, AGENT-perspective
+    value) or (None, None) if the budget ran out."""
+    conv = _bb_from_cells(cells0, mover)
+    if conv is None:
+        return None, None
+    position, mask, _moves = conv
+    solver = _BBSolver(max_nodes, deadline)
+    col, score = solver.best_move(position, mask)
+    if col is None or score is None:
+        return None, None
+    sign = (score > 0) - (score < 0)
+    return col, float(sign if mover == _AGENT else -sign)
+
+
 class _EndgameTimeout(Exception):
     pass
 
@@ -644,7 +875,14 @@ def _adversarial_plan_action(cells0):
         return None
 
     if _ENDGAME_MAX_COLS and len(root_legal) <= _ENDGAME_MAX_COLS:
-        exact_a, _exact_val = _exact_endgame_solve(cells0, _AGENT, deadline=time.time() + _ENDGAME_TIME_BUDGET)
+        # Bitboard solver first: faster, reaches further, and RESISTS in a
+        # lost position instead of picking the fastest loss. The older
+        # value-only solver stays as the fallback -- if the budget is
+        # missed we try it, then the round search, exactly as before.
+        _eg_deadline = time.time() + _ENDGAME_TIME_BUDGET
+        exact_a, _exact_val = _bitboard_endgame_solve(cells0, _AGENT, deadline=_eg_deadline)
+        if exact_a is None:
+            exact_a, _exact_val = _exact_endgame_solve(cells0, _AGENT, deadline=_eg_deadline)
         if exact_a is not None:
             return exact_a
         # else: timed out -- fall through to the round-based search below
@@ -822,8 +1060,8 @@ def main(ckpt_path=CKPT_PATH, memory_ckpt_path=None, n_memory_games=500,
          memory_opponent_epsilon=0.2, memory_opponent_strong_epsilon=0.3,
          memory_weight=0.25, memory_k=5, online_lr=1e-5, online_updates_per_episode=4,
          online_batch_size=256, unsolved_penalty_mult=1.0, adv_rounds=2, seed=0,
-         online_enabled=False, endgame_max_cols=5, endgame_time_budget=1.2,
-         deeper_rounds=None, deeper_max_branching=4, deeper_time_budget=0.6):
+         online_enabled=False, endgame_max_cols=6, endgame_time_budget=0.6,
+         deeper_rounds=None, deeper_max_branching=4, deeper_time_budget=0.6, out_path=None):
     import random
     from connectx.env import ConnectXEnv
     from connectx.memory_build import build_episodic_memory
@@ -866,10 +1104,14 @@ def main(ckpt_path=CKPT_PATH, memory_ckpt_path=None, n_memory_games=500,
         deeper_rounds=deeper_rounds, deeper_max_branching=deeper_max_branching,
         deeper_time_budget=deeper_time_budget,
     )
-    with open(OUT_PATH, "w") as f:
+    #  defaults to OUT_PATH -- the DEPLOYED submission. It exists
+    # because that used to be hardcoded, so any experimental build silently
+    # overwrote the shipped file.
+    dest = out_path or OUT_PATH
+    with open(dest, "w") as f:
         f.write(out)
     size_kb = len(out.encode("utf-8")) / 1024
-    print(f"Wrote {OUT_PATH} ({len(memory_zs)} memory states, {size_kb:.1f} KB)")
+    print(f"Wrote {dest} ({len(memory_zs)} memory states, {size_kb:.1f} KB)")
 
 
 if __name__ == "__main__":

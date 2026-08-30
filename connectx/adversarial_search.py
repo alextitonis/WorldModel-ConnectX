@@ -184,6 +184,50 @@ def _narrow_to_center(legal_cols, width, max_branching):
     return sorted(legal_cols, key=lambda c: abs(c - center))[:max_branching]
 
 
+def _resisting_endgame_solve(cells0, mover, width, height, win_len, deadline,
+                             max_nodes=400_000):
+    """`_exact_endgame_solve` with a distance preference, via the bitboard solver.
+
+    WHY THIS EXISTS. `_exact_endgame_solve` returns only +1/0/-1 -- it carries
+    NO information about HOW FAST a result arrives. That is fine for deciding
+    whether a position is won, and it is what the deployed agent has always
+    used. But it has a consequence nobody had looked at: **when every move
+    loses, every move scores identically, so the solver picks arbitrarily --
+    frequently choosing the FASTEST way to lose.**
+
+    Against a perfect opponent that costs nothing; the game is lost either way.
+    Against the imperfect opponents an actual ladder is full of, it throws away
+    every chance the opponent errs before converting. Resisting longer is
+    strictly better there and never worse.
+
+    (The same blindness in the other direction was measured while labelling
+    training positions: the legacy solver's chosen line disagreed with the true
+    distance-to-win on 9 of 25 positions, shorter in 7 and longer in 2.)
+
+    `connectx_bitboard_solver`'s score encodes distance, so its argmax already
+    prefers the slowest loss and the fastest win. This wraps it in
+    `_exact_endgame_solve`'s exact signature and AGENT-perspective return
+    convention, so it is a drop-in.
+
+    Returns `(best_action, value)` with `value` in the same +1 AGENT-wins /
+    0 / -1 convention, or `(None, None)` if the budget ran out."""
+    from .bitboard_solver import (Solver, cells_to_bitboard,
+                                  agent_perspective_value)
+    import time as _time
+    budget = max(0.0, deadline - _time.time())
+    if budget <= 0.0:
+        return None, None
+    try:
+        position, mask, _moves = cells_to_bitboard(list(cells0), mover)
+    except ValueError:
+        return None, None
+    solver = Solver(max_nodes=max_nodes, time_budget=budget)
+    col, score = solver.best_move(position, mask)
+    if col is None:
+        return None, None
+    return col, agent_perspective_value(score, mover)
+
+
 class _RoundSearchTimeout(Exception):
     pass
 

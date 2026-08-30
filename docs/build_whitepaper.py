@@ -176,6 +176,70 @@ p("The insight that made this cheap: branching factor is controlled by how many 
   "trivial to solve exactly if only a few columns remain open -- exactly the shape a real Connect-4 "
   "endgame takes once most of the board has filled.")
 
+h2("2.4a The bitboard solver -- and how a 92.5%-agreeing implementation was caught being wrong")
+p("The solver above is plain Python with a memo keyed on the full board tuple, and its own "
+  "docstring gates callers at 5 or fewer legal columns because that is its practical reach. Two "
+  "things were blocked behind that gate: a strong enough opponent to tell agent configurations "
+  "apart (see Section 5.1), and any analysis of a real loss that was decided before the endgame.")
+p("connectx/bitboard_solver.py removes it. A position becomes two integers over a "
+  "seven-bits-per-column layout, where one sentinel bit per column stops shifted patterns from "
+  "wrapping between columns; win detection is four shift-and-mask operations instead of a scan over "
+  "every cell and direction. The key is position + mask, which is a bijective encoding of a "
+  "Connect-4 position, so the transposition table is keyed on one integer rather than a 42-element "
+  "tuple. Crucially the table stores LOWER and UPPER BOUNDS rather than plain values, so a cutoff "
+  "found under one alpha-beta window still prunes under a different one -- the older memo caches "
+  "only values produced under whatever window happened to be live, which is why it must rebuild a "
+  "fresh memo on every call. Moves that hand the opponent an immediate win are pruned before search, "
+  "a position with two distinct forced replies is resolved with no recursion at all, and moves are "
+  "ordered by how many new threats each creates rather than merely centre-out.")
+p("Measured against the older solver on the same positions: 50 to 70 times faster, and it resolves "
+  "midgame positions with six or more open columns that the older one could not resolve at a "
+  "900-second budget.")
+p("HOW IT WAS VALIDATED is the part worth reporting. The first version agreed with the deployed "
+  "solver on 37 of 40 randomly reached endgame positions -- a residual that reads like edge-case "
+  "noise in fresh code. It was not. A third implementation was written specifically to adjudicate "
+  "(connectx/solver_referee.py: plain minimax, NO alpha-beta at all, win detection via the "
+  "environment cell scan, sharing no machinery with either solver so a bit-layout error could not "
+  "be reproduced), and it judged all three disagreements: the NEW solver was wrong in 3 of 3, the "
+  "deployed one right in 3 of 3. The cause was a single line -- the position update must assign the "
+  "newly played stone to the player who just moved, and writing it the other way hands one's own "
+  "stone to the opponent on every ply. After the fix, 40 of 40.")
+p("The general rule this earns: two solvers disagreeing tells you one is wrong but not which, and "
+  "the deployed one being deployed is only evidence that nothing has caught it yet. An adjudicating "
+  "third implementation that shares no machinery costs about eighty lines. A high agreement rate is "
+  "not a pass -- the residual is where the bug lives.")
+
+h2("2.4b Resisting in a lost endgame -- a measured consequence of value-only solving")
+p("The older solver returns only +1, 0 or -1. It carries no information about HOW FAST a result "
+  "arrives. That is sound for deciding whether a position is won, and it is what the deployed agent "
+  "has always used, but it has a consequence nobody had examined: when every move loses, every move "
+  "scores identically, so the solver picks arbitrarily -- frequently choosing the fastest way to "
+  "lose. Against perfect play that costs nothing, since the game is lost either way. Against the "
+  "imperfect agents a real ladder is full of, it discards every chance the opponent errs before "
+  "converting.")
+p("The bitboard solver's score encodes distance, so its argmax already prefers the slowest loss and "
+  "the fastest win. _resisting_endgame_solve wraps it in the older solver's exact signature. It was "
+  "then measured rather than assumed: positions were sampled that the solver PROVES are losses, and "
+  "each was played out twice from the identical position against the identical opponent with paired "
+  "seeds -- once choosing our moves with the value-only solver, once with the distance-aware one. An "
+  "escape is any non-loss, since from a proven-lost position a draw is equally the opponent failing "
+  "to convert.")
+table(
+    ["opponent", "legacy escapes", "resisting escapes", "game length"],
+    [
+        ["perfect play (control)", "0.000", "0.000", "+4.3 plies"],
+        ["weak heuristic", "0.100", "0.300", "+3.5 plies"],
+        ["stronger heuristic", "0.150", "0.225", "+3.8 plies"],
+    ],
+    [70, 38, 42, 40],
+)
+p("The control decides whether the rest means anything: against an opponent that never errs both "
+  "arms escape exactly 0.000, because the positions really are lost -- while the resisting arm still "
+  "survives 4.3 plies longer. The mechanism does what it claims without manufacturing false escapes. "
+  "At n=40 the +0.200 against the weak heuristic is solid and the +0.075 against the stronger one is "
+  "directional only. The option is opt-in and is NOT wired into the shipped submission.py: it is "
+  "offered as a measured option, not a default.")
+
 h2("2.5 Episodic memory, LoRA fine-tuning, and online learning")
 p("Three more general-purpose mechanisms were applied on top of the search:")
 bullet("Episodic memory: a k-NN lookup over real self-play trajectories, both won and lost (a "
@@ -292,6 +356,26 @@ p("On Kaggle's own rating (a TrueSkill-style Gaussian score that starts uncertai
   "first player wins with perfect play) [6], so the real competitive pool likely includes near-"
   "perfect solvers -- the results above demonstrate the ARCHITECTURE works on this domain; they "
   "should not be read as a leaderboard-rating prediction.")
+
+h2("5.1 The evaluation was saturated -- and what a discriminating opponent showed")
+p("The win rates above are measured against heuristic opponents, and by 2026-08-30 they had stopped "
+  "carrying information: the single-member baseline scored 20/20, 20/20 and 19/20, and a held-out "
+  "opponent suite returned 1.000 on five of six opponents including its strongest. A comparison "
+  "between two agent configurations could produce at most a one-game difference. Every mechanism "
+  "result on this domain was being measured against a ceiling.")
+p("With the bitboard solver available, a genuinely stronger opponent could be built: the same "
+  "stronger heuristic used above, with PROVEN-OPTIMAL play layered on top wherever its budget "
+  "allows. It reports the fraction of its own moves it actually proved, because an opponent that "
+  "proved one move in seven is a hybrid and calling it perfect play would manufacture exactly the "
+  "false ceiling it exists to remove. Uniformly random legal play scores 0.000 against it, "
+  "confirming it is genuinely strong rather than merely different, and both agents come off the "
+  "ceiling where the old suite had pinned them at 1.000.")
+p("One caution learned the hard way, and it is general: the opponent was initially budgeted in "
+  "WALL-CLOCK time, so on a quieter machine it proved more moves and became a stronger opponent. "
+  "One seed scored 0.812 at coverage 0.14 and 0.875 at coverage 0.20 under identical flags -- the "
+  "measuring stick moved between measurements, producing first a false positive and then a false "
+  "retraction. Switching to a node budget made cells reproducible exactly. Before trusting any "
+  "evaluation, check whether any part of it is budgeted in wall-clock time.")
 
 h1("6. Honest limitations")
 bullet("The zugzwang-avoidance problem (Section 4) is diagnosed and a first fix attempt is measured, "
