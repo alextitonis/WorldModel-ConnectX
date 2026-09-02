@@ -69,7 +69,7 @@ seen during training.
 
 | Configuration | vs random | vs weak heuristic | vs stronger heuristic |
 |---|---|---|---|
-| Latent beam search (original baseline) | 63.3% | 0.0% | 6.7% |
+| Latent beam search (original baseline)² | 63.3% | 0.0% | 6.7% |
 | Real adversarial search (1 round) | 96.7% | 100.0% | 66.7% |
 | + episodic memory + online learner | 98.3% | 78.3%¹ | 50.0% |
 | + a real bug fixed (loss ≠ draw) | 100.0% | 100.0% | 80.0% |
@@ -83,12 +83,29 @@ sequentially in one process, so the online learner had already drifted from
 the whitepaper for the full table, the diagnosis, and every real bug found
 along the way (7 of them — a couple are worth knowing if you build on this).
 
-On Kaggle's own real rating: this is a TrueSkill-style score that starts
-uncertain and converges over dozens of real games — don't read a
-freshly-uploaded rating as a verdict. 7x6 Connect-4 is a mathematically
-**solved** game, so the real competitive pool likely includes near-perfect
-solvers; these results demonstrate the architecture works on this domain,
-not a leaderboard-rating prediction.
+² Named for the contrast it draws, but stated precisely: the rollout and the
+value judgement in `connectx/search.py` are fully latent, while the *legality*
+of each branch is not. The root ply's allowed set comes from `env.is_legal` on
+the real state, and deeper plies decode each beam entry back to an estimated
+real state and ask `env.is_legal` about that — always, at the default
+`caution=1.0`. Only `depth=1` never decodes. So the row above is latent
+dynamics and latent evaluation with environment-defined legality gating, not a
+search that never touches the real rules; the contrast with the row beneath it
+is *imagined vs. enumerated opponent replies*, which is the part that actually
+moved the numbers.
+
+### On Kaggle's own leaderboard (2026-09-02)
+
+The deployed `submission.py` currently sits at **630 rating, rank 66 / 190**.
+
+Kaggle's number is a TrueSkill-style score that starts near 600 and converges
+over dozens of real games, so a freshly-uploaded rating is not a verdict in
+either direction, and this one will keep moving. For context on the ceiling:
+7x6 Connect-4 is a mathematically **solved** game, so the pool above this
+rating includes near-perfect solvers, and Kaggle's per-move time cap is as much
+the binding constraint as evaluation quality. Read 630 as evidence the
+architecture transfers to a real adversarial ladder — not as a claim about how
+near the top of one it is.
 
 ## The exact solver, and what it changed (2026-08-30)
 
@@ -263,7 +280,7 @@ connectx-opensource/
     model.py                         Encoder / dynamics / value head / decoder
     train_utils.py                   Self-supervised stage-1 training (no oracle, no labels)
     verifier.py                      On-policy Monte Carlo value-head training (no oracle)
-    search.py                        Latent-space search (comparison baseline) + load_checkpoint
+    search.py                        Latent-space search (comparison baseline; decode-gated legality) + load_checkpoint
     adversarial_search.py            The REAL search actually deployed: minimax + exact endgame solver
                                       + the experimental parity-heuristic attempt (Section 4.1)
     episodic_memory.py               k-NN memory over real self-play trajectories (won + lost)
